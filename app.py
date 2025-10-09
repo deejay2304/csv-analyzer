@@ -108,6 +108,12 @@ def numeric_safe(df, cols):
 
 @st.cache_data
 def prepare_df_from_uploaded(uploaded_file):
+    """
+    Read CSV (try utf-8 then latin-1), canonicalize columns and basic cleaning.
+    If multiple original columns map to the same canonical name, make them unique
+    by appending _1, _2, ... to avoid 'duplicate keys' errors.
+    """
+    # 1) Read CSV (utf-8 then latin-1 fallback)
     try:
         raw = uploaded_file.getvalue().decode("utf-8", errors="replace")
         df = pd.read_csv(StringIO(raw))
@@ -118,14 +124,32 @@ def prepare_df_from_uploaded(uploaded_file):
         except Exception as e:
             raise e
 
+    # 2) Canonicalize column names (maps known aliases)
     df = canonicalize_columns(df)
 
+    # 3) Ensure column names are unique: if canonicalization produced duplicates,
+    #    append suffixes _1, _2, ... to make them unique.
+    cols = list(df.columns)
+    seen = {}
+    new_cols = []
+    for col in cols:
+        if col not in seen:
+            seen[col] = 1
+            new_cols.append(col)
+        else:
+            seen[col] += 1
+            new_cols.append(f"{col}_{seen[col]}")  # e.g., 'total_2'
+    df.columns = new_cols
+
+    # 4) Try to coerce common datetime columns
     dt_candidates = ["order_date", "delivery_date", "return_date"]
     df = to_datetime_safe(df, dt_candidates)
 
+    # 5) Numeric coercion
     num_candidates = ["qty", "total", "net_profit", "expected_profit", "cogs", "payment_received", "payment_delta"]
     df = numeric_safe(df, num_candidates)
 
+    # 6) Derived columns (if order_date exists)
     if "order_date" in df.columns:
         df["order_date_only"] = df["order_date"].dt.date
         df["order_month"] = df["order_date"].dt.to_period("M").astype(str)
@@ -137,6 +161,7 @@ def prepare_df_from_uploaded(uploaded_file):
         df["order_week"] = None
         df["order_dayofweek"] = None
 
+    # 7) Standardize order_status and channel to strings if present
     if "order_status" in df.columns:
         df["order_status"] = df["order_status"].astype(str)
     if "channel" in df.columns:
