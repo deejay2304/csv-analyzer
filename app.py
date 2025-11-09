@@ -7,46 +7,96 @@ from datetime import datetime
 
 st.set_page_config(layout="wide", page_title="Fashion E-commerce Dashboard")
 
-# ---------- Helpers ----------
+# ---------- Small helper to read CSV when available ----------
 @st.cache_data
-def load_data(path="data.csv"):
-    df = pd.read_csv(path, parse_dates=['order_date'])
+def read_csv_from_path(path: str):
+    return pd.read_csv(path, parse_dates=['order_date'])
+
+def clean_and_enrich(df: pd.DataFrame) -> pd.DataFrame:
     # basic cleaning / derived columns
-    df['qty'] = pd.to_numeric(df['qty'], errors='coerce').fillna(0).astype(int)
-    df['price'] = pd.to_numeric(df['price'], errors='coerce').fillna(0.0)
-    df['cogs'] = pd.to_numeric(df['cogs'], errors='coerce').fillna(0.0)
-    # settlement amount assumed same as price*qty unless separate column exists
+    df = df.copy()
+    df['qty'] = pd.to_numeric(df.get('qty', 0), errors='coerce').fillna(0).astype(int)
+    df['price'] = pd.to_numeric(df.get('price', 0.0), errors='coerce').fillna(0.0)
+    df['cogs'] = pd.to_numeric(df.get('cogs', 0.0), errors='coerce').fillna(0.0)
+    # settlement amount: prefer 'stlmnt' or fallback to price*qty
     if 'stlmnt' in df.columns:
-        df['settlement_amount'] = pd.to_numeric(df['stlmnt'], errors='coerce').fillna(df['price'] * df['qty'])
+        df['settlement_amount'] = pd.to_numeric(df.get('stlmnt'), errors='coerce').fillna(df['price'] * df['qty'])
     else:
         df['settlement_amount'] = df['price'] * df['qty']
     df['profit'] = df['settlement_amount'] - (df['cogs'] * df['qty'])
-    df['order_date'] = pd.to_datetime(df['order_date'])
+    # ensure order_date parsed
+    if 'order_date' in df.columns:
+        df['order_date'] = pd.to_datetime(df['order_date'], errors='coerce')
+    else:
+        st.warning("CSV has no 'order_date' column — date-based visuals will be disabled.")
     return df
 
-# ---------- Load ----------
-df = load_data("data.csv")
+# ---------- Try to load data.csv from repo first ----------
+df = None
+CSV_PATH = "data.csv"
+
+try:
+    df = read_csv_from_path(CSV_PATH)
+except FileNotFoundError:
+    st.info(f"Could not find '{CSV_PATH}' in the app folder.")
+except Exception as e:
+    # Show the error so it's easier to debug during development
+    st.error(f"Error reading '{CSV_PATH}': {e}")
+
+# ---------- If not found, ask user to upload a CSV via browser ----------
+if df is None:
+    st.sidebar.markdown("## Upload CSV (fallback)")
+    uploaded_file = st.sidebar.file_uploader("Upload your data.csv (or any CSV with required columns)", type=["csv"])
+    if uploaded_file is None:
+        st.sidebar.markdown(
+            """
+            **How to fix:**  
+            1. Put `data.csv` in the root of your app repository and redeploy (recommended for Streamlit Cloud).  
+            2. Or upload the CSV here from your local machine to run the app now.
+            """
+        )
+        st.stop()
+    else:
+        try:
+            df = pd.read_csv(uploaded_file, parse_dates=['order_date'])
+        except Exception as e:
+            st.error(f"Uploaded file could not be read as CSV: {e}")
+            st.stop()
+
+# ---------- Clean/enrich dataframe ----------
+df = clean_and_enrich(df)
 
 # ---------- Sidebar filters ----------
 st.sidebar.header("Filters")
-min_date = df['order_date'].min().date()
-max_date = df['order_date'].max().date()
-date_range = st.sidebar.date_input("Order date range", [min_date, max_date])
+min_date = df['order_date'].min().date() if 'order_date' in df.columns and pd.notnull(df['order_date'].min()) else None
+max_date = df['order_date'].max().date() if 'order_date' in df.columns and pd.notnull(df['order_date'].max()) else None
 
-channels = st.sidebar.multiselect("Channel(s)", options=sorted(df['channel'].dropna().unique()), default=sorted(df['channel'].dropna().unique()))
-styles = st.sidebar.multiselect("Style ID(s)", options=sorted(df['style_id'].dropna().unique()), default=None)
-sizes = st.sidebar.multiselect("Size(s)", options=sorted(df['size'].dropna().unique()), default=None)
+if min_date and max_date:
+    date_range = st.sidebar.date_input("Order date range", [min_date, max_date])
+else:
+    date_range = None
+
+channels = sorted(df['channel'].dropna().unique()) if 'channel' in df.columns else []
+channels_selected = st.sidebar.multiselect("Channel(s)", options=channels, default=channels)
+
+styles = sorted(df['style_id'].dropna().unique()) if 'style_id' in df.columns else []
+styles_selected = st.sidebar.multiselect("Style ID(s)", options=styles, default=None)
+
+sizes = sorted(df['size'].dropna().unique()) if 'size' in df.columns else []
+sizes_selected = st.sidebar.multiselect("Size(s)", options=sizes, default=None)
 
 # apply filters
-start_dt = pd.to_datetime(date_range[0])
-end_dt = pd.to_datetime(date_range[1])
-mask = (df['order_date'] >= start_dt) & (df['order_date'] <= end_dt)
-if channels:
-    mask &= df['channel'].isin(channels)
-if styles:
-    mask &= df['style_id'].isin(styles)
-if sizes:
-    mask &= df['size'].isin(sizes)
+mask = pd.Series(True, index=df.index)
+if date_range and len(date_range) == 2 and 'order_date' in df.columns:
+    start_dt = pd.to_datetime(date_range[0])
+    end_dt = pd.to_datetime(date_range[1])
+    mask &= (df['order_date'] >= start_dt) & (df['order_date'] <= end_dt)
+if channels_selected:
+    mask &= df['channel'].isin(channels_selected)
+if styles_selected:
+    mask &= df['style_id'].isin(styles_selected)
+if sizes_selected:
+    mask &= df['size'].isin(sizes_selected)
 
 dff = df[mask].copy()
 
@@ -54,11 +104,11 @@ dff = df[mask].copy()
 st.title("Fashion E-commerce Dashboard")
 kpi1, kpi2, kpi3, kpi4 = st.columns(4)
 
-total_sales = dff['settlement_amount'].sum()
-total_orders = dff['order_id'].nunique()
-total_qty = dff['qty'].sum()
+total_sales = dff['settlement_amount'].sum() if not dff.empty else 0
+total_orders = dff['order_id'].nunique() if 'order_id' in dff.columns else len(dff)
+total_qty = dff['qty'].sum() if 'qty' in dff.columns else 0
 avg_order_value = total_sales / total_orders if total_orders else 0
-total_profit = dff['profit'].sum()
+total_profit = dff['profit'].sum() if 'profit' in dff.columns else 0
 
 kpi1.metric("Total Sales", f"₹{total_sales:,.0f}")
 kpi2.metric("Total Orders", f"{total_orders:,}")
@@ -68,30 +118,27 @@ kpi4.metric("Total Profit", f"₹{total_profit:,.0f}")
 st.markdown("---")
 
 # ---------- Charts ----------
-# 1) Sales trend
 st.subheader("Sales Trend")
-if not dff.empty:
+if not dff.empty and 'order_date' in dff.columns:
     sales_by_date = dff.groupby(pd.Grouper(key='order_date', freq='D')).agg({'settlement_amount':'sum'}).reset_index()
     fig_trend = px.line(sales_by_date, x='order_date', y='settlement_amount', title="Daily Sales", labels={'order_date':'Date','settlement_amount':'Sales (₹)'})
     st.plotly_chart(fig_trend, use_container_width=True)
 else:
-    st.info("No data for the selected filters.")
+    st.info("No date-based sales data available for the selected filters.")
 
-# 2) Sales by channel
 st.subheader("Sales by Channel")
-channel_agg = dff.groupby('channel').agg({'settlement_amount':'sum','order_id':'nunique'}).rename(columns={'order_id':'orders'}).reset_index()
-if not channel_agg.empty:
+if 'channel' in dff.columns and not dff.empty:
+    channel_agg = dff.groupby('channel').agg({'settlement_amount':'sum','order_id':'nunique'}).rename(columns={'order_id':'orders'}).reset_index()
     fig_channel = px.bar(channel_agg.sort_values('settlement_amount', ascending=False),
                          x='channel', y='settlement_amount', text='orders',
-                         title="Sales by Channel (click bars to inspect)")
+                         title="Sales by Channel")
     fig_channel.update_layout(xaxis={'categoryorder':'total descending'})
     st.plotly_chart(fig_channel, use_container_width=True)
 else:
     st.write("No channel data.")
 
-# 3) Profit by style (box + top styles)
 st.subheader("Profit & Performance by Style")
-if 'style_id' in dff.columns:
+if 'style_id' in dff.columns and not dff.empty:
     top_styles = (dff.groupby('style_id')
                     .agg(total_sales=('settlement_amount','sum'),
                          total_qty=('qty','sum'),
@@ -103,14 +150,13 @@ if 'style_id' in dff.columns:
     fig_style_profit = px.box(dff, x='style_id', y='profit', title='Profit distribution by style (all styles)', points='outliers')
     st.plotly_chart(fig_style_profit, use_container_width=True)
 else:
-    st.write("No style_id column.")
+    st.write("No style_id data.")
 
-# 4) Size & color mix
 left, right = st.columns(2)
 with left:
     st.subheader("Quantity by Size")
-    size_agg = dff.groupby('size').agg({'qty':'sum'}).reset_index().sort_values('qty', ascending=False)
-    if not size_agg.empty:
+    if 'size' in dff.columns and not dff.empty:
+        size_agg = dff.groupby('size').agg({'qty':'sum'}).reset_index().sort_values('qty', ascending=False)
         fig_size = px.bar(size_agg, x='size', y='qty', title='Quantity sold by size', labels={'qty':'Quantity'})
         st.plotly_chart(fig_size, use_container_width=True)
     else:
@@ -118,16 +164,14 @@ with left:
 
 with right:
     st.subheader("Top Colors")
-    color_agg = dff.groupby('color').agg({'qty':'sum'}).reset_index().sort_values('qty', ascending=False).head(10)
-    if not color_agg.empty:
+    if 'color' in dff.columns and not dff.empty:
+        color_agg = dff.groupby('color').agg({'qty':'sum'}).reset_index().sort_values('qty', ascending=False).head(10)
         fig_color = px.pie(color_agg, values='qty', names='color', title='Top 10 Colors by Quantity')
         st.plotly_chart(fig_color, use_container_width=True)
     else:
         st.write("No color data.")
 
 st.markdown("---")
-
-# ---------- Orders table with download ----------
 st.subheader("Orders (sample)")
 if not dff.empty:
     st.dataframe(dff.sort_values('order_date', ascending=False).head(500))
@@ -136,7 +180,5 @@ if not dff.empty:
 else:
     st.info("No orders to show for selected filters.")
 
-# ---------- Footer / notes ----------
 st.markdown("---")
 st.caption("Columns used: order_date, order_id, sku_id, channel, qty, price, cogs, order_status, size, color, stlmnt, style_id, style_color_id")
-
